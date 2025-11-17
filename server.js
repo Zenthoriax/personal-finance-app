@@ -1,5 +1,5 @@
 const express = require('express');
-const mysql = require('mysql2/promise');
+const { Pool } = require('pg'); // Changed: Use PostgreSQL Pool
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
@@ -14,28 +14,29 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Database connection
+// Database connection configuration (using environment variables from .env)
 const dbConfig = {
     host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'personal_finance_db'
+    user: process.env.DB_USER || 'postgres', // Expected PostgreSQL user
+    password: process.env.DB_PASSWORD || 'Jeeva@9806', // Your Docker password
+    database: process.env.DB_NAME || 'personal_finance_db',
+    port: process.env.DB_PORT || 5432 // PostgreSQL port
 };
 
-let db;
+const pool = new Pool(dbConfig); // Changed: Create a Pool instead of a single connection
 
-// Initialize database connection
+// Initialize database connection (now just checking connection)
 async function initDB() {
     try {
-        db = await mysql.createConnection(dbConfig);
-        console.log('Connected to MySQL database');
+        await pool.connect();
+        console.log('Connected to PostgreSQL database');
     } catch (error) {
         console.error('Database connection error:', error);
         process.exit(1);
     }
 }
 
-// Authentication middleware
+// Authentication middleware (no changes needed here)
 const authenticateToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -64,9 +65,9 @@ app.post('/api/auth/register', async (req, res) => {
             return res.status(400).json({ error: 'All fields are required' });
         }
 
-        // Check if user exists
-        const [existingUsers] = await db.execute(
-            'SELECT * FROM users WHERE email = ? OR username = ?',
+        // Check if user exists (Changed: $1, $2 parameters)
+        const { rows: existingUsers } = await pool.query(
+            'SELECT * FROM users WHERE email = $1 OR username = $2',
             [email, username]
         );
 
@@ -77,19 +78,22 @@ app.post('/api/auth/register', async (req, res) => {
         // Hash password
         const passwordHash = await bcrypt.hash(password, 10);
 
-        // Insert user
-        const [result] = await db.execute(
-            'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
+        // Insert user (Changed: $1, $2, $3 parameters AND RETURNING user_id)
+        const { rows: resultRows } = await pool.query(
+            'INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING user_id',
             [username, email, passwordHash]
         );
 
+        // Changed: Get inserted ID from resultRows[0]
+        const newUserId = resultRows[0].user_id;
+
         // Generate token
-        const token = jwt.sign({ userId: result.insertId }, JWT_SECRET, { expiresIn: '7d' });
+        const token = jwt.sign({ userId: newUserId }, JWT_SECRET, { expiresIn: '7d' });
 
         res.status(201).json({
             message: 'User registered successfully',
             token,
-            userId: result.insertId
+            userId: newUserId
         });
     } catch (error) {
         console.error('Registration error:', error);
@@ -106,9 +110,9 @@ app.post('/api/auth/login', async (req, res) => {
             return res.status(400).json({ error: 'Email and password are required' });
         }
 
-        // Find user
-        const [users] = await db.execute(
-            'SELECT * FROM users WHERE email = ?',
+        // Find user (Changed: $1 parameter)
+        const { rows: users } = await pool.query(
+            'SELECT * FROM users WHERE email = $1',
             [email]
         );
 
@@ -145,8 +149,9 @@ app.post('/api/auth/login', async (req, res) => {
 // Get all categories
 app.get('/api/categories', authenticateToken, async (req, res) => {
     try {
-        const [categories] = await db.execute(
-            'SELECT * FROM categories WHERE user_id = ? ORDER BY category_name',
+        // Changed: $1 parameter
+        const { rows: categories } = await pool.query(
+            'SELECT * FROM categories WHERE user_id = $1 ORDER BY category_name',
             [req.userId]
         );
         res.json(categories);
@@ -165,14 +170,16 @@ app.post('/api/categories', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Category name and type are required' });
         }
 
-        const [result] = await db.execute(
-            'INSERT INTO categories (user_id, category_name, category_type) VALUES (?, ?, ?)',
+        // Changed: $1, $2, $3 parameters AND RETURNING category_id
+        const { rows: resultRows } = await pool.query(
+            'INSERT INTO categories (user_id, category_name, category_type) VALUES ($1, $2, $3) RETURNING category_id',
             [req.userId, category_name, category_type]
         );
 
-        res.status(201).json({ message: 'Category created', categoryId: result.insertId });
+        res.status(201).json({ message: 'Category created', categoryId: resultRows[0].category_id });
     } catch (error) {
-        if (error.code === 'ER_DUP_ENTRY') {
+        // Changed: PostgreSQL error code is '23505' for unique constraint violation
+        if (error.code === '23505') {
             return res.status(400).json({ error: 'Category already exists' });
         }
         console.error('Create category error:', error);
@@ -183,12 +190,14 @@ app.post('/api/categories', authenticateToken, async (req, res) => {
 // Delete category
 app.delete('/api/categories/:id', authenticateToken, async (req, res) => {
     try {
-        const [result] = await db.execute(
-            'DELETE FROM categories WHERE category_id = ? AND user_id = ?',
+        // Changed: $1, $2 parameters
+        const result = await pool.query(
+            'DELETE FROM categories WHERE category_id = $1 AND user_id = $2',
             [req.params.id, req.userId]
         );
 
-        if (result.affectedRows === 0) {
+        // Changed: Use rowCount
+        if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Category not found' });
         }
 
@@ -204,8 +213,9 @@ app.delete('/api/categories/:id', authenticateToken, async (req, res) => {
 // Get all accounts
 app.get('/api/accounts', authenticateToken, async (req, res) => {
     try {
-        const [accounts] = await db.execute(
-            'SELECT * FROM accounts WHERE user_id = ? ORDER BY account_name',
+        // Changed: $1 parameter
+        const { rows: accounts } = await pool.query(
+            'SELECT * FROM accounts WHERE user_id = $1 ORDER BY account_name',
             [req.userId]
         );
         res.json(accounts);
@@ -224,12 +234,13 @@ app.post('/api/accounts', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Account name and type are required' });
         }
 
-        const [result] = await db.execute(
-            'INSERT INTO accounts (user_id, account_name, account_type, balance) VALUES (?, ?, ?, ?)',
+        // Changed: $1, $2, $3, $4 parameters AND RETURNING account_id
+        const { rows: resultRows } = await pool.query(
+            'INSERT INTO accounts (user_id, account_name, account_type, balance) VALUES ($1, $2, $3, $4) RETURNING account_id',
             [req.userId, account_name, account_type, balance || 0]
         );
 
-        res.status(201).json({ message: 'Account created', accountId: result.insertId });
+        res.status(201).json({ message: 'Account created', accountId: resultRows[0].account_id });
     } catch (error) {
         console.error('Create account error:', error);
         res.status(500).json({ error: 'Server error' });
@@ -241,12 +252,14 @@ app.put('/api/accounts/:id', authenticateToken, async (req, res) => {
     try {
         const { account_name, account_type, balance } = req.body;
 
-        const [result] = await db.execute(
-            'UPDATE accounts SET account_name = ?, account_type = ?, balance = ? WHERE account_id = ? AND user_id = ?',
+        // Changed: $1, $2, $3, $4, $5 parameters
+        const result = await pool.query(
+            'UPDATE accounts SET account_name = $1, account_type = $2, balance = $3 WHERE account_id = $4 AND user_id = $5',
             [account_name, account_type, balance, req.params.id, req.userId]
         );
 
-        if (result.affectedRows === 0) {
+        // Changed: Use rowCount
+        if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Account not found' });
         }
 
@@ -260,12 +273,14 @@ app.put('/api/accounts/:id', authenticateToken, async (req, res) => {
 // Delete account
 app.delete('/api/accounts/:id', authenticateToken, async (req, res) => {
     try {
-        const [result] = await db.execute(
-            'DELETE FROM accounts WHERE account_id = ? AND user_id = ?',
+        // Changed: $1, $2 parameters
+        const result = await pool.query(
+            'DELETE FROM accounts WHERE account_id = $1 AND user_id = $2',
             [req.params.id, req.userId]
         );
 
-        if (result.affectedRows === 0) {
+        // Changed: Use rowCount
+        if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Account not found' });
         }
 
@@ -281,11 +296,12 @@ app.delete('/api/accounts/:id', authenticateToken, async (req, res) => {
 // Get all budgets
 app.get('/api/budgets', authenticateToken, async (req, res) => {
     try {
-        const [budgets] = await db.execute(
+        // Changed: $1 parameter
+        const { rows: budgets } = await pool.query(
             `SELECT b.*, c.category_name 
              FROM budgets b 
              JOIN categories c ON b.category_id = c.category_id 
-             WHERE b.user_id = ? 
+             WHERE b.user_id = $1 
              ORDER BY b.period_start DESC`,
             [req.userId]
         );
@@ -305,12 +321,13 @@ app.post('/api/budgets', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'All fields are required' });
         }
 
-        const [result] = await db.execute(
-            'INSERT INTO budgets (user_id, category_id, budget_amount, period_start, period_end) VALUES (?, ?, ?, ?, ?)',
+        // Changed: $1 - $5 parameters AND RETURNING budget_id
+        const { rows: resultRows } = await pool.query(
+            'INSERT INTO budgets (user_id, category_id, budget_amount, period_start, period_end) VALUES ($1, $2, $3, $4, $5) RETURNING budget_id',
             [req.userId, category_id, budget_amount, period_start, period_end]
         );
 
-        res.status(201).json({ message: 'Budget created', budgetId: result.insertId });
+        res.status(201).json({ message: 'Budget created', budgetId: resultRows[0].budget_id });
     } catch (error) {
         console.error('Create budget error:', error);
         res.status(500).json({ error: 'Server error' });
@@ -322,12 +339,14 @@ app.put('/api/budgets/:id', authenticateToken, async (req, res) => {
     try {
         const { budget_amount, period_start, period_end } = req.body;
 
-        const [result] = await db.execute(
-            'UPDATE budgets SET budget_amount = ?, period_start = ?, period_end = ? WHERE budget_id = ? AND user_id = ?',
+        // Changed: $1 - $5 parameters
+        const result = await pool.query(
+            'UPDATE budgets SET budget_amount = $1, period_start = $2, period_end = $3 WHERE budget_id = $4 AND user_id = $5',
             [budget_amount, period_start, period_end, req.params.id, req.userId]
         );
 
-        if (result.affectedRows === 0) {
+        // Changed: Use rowCount
+        if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Budget not found' });
         }
 
@@ -341,12 +360,14 @@ app.put('/api/budgets/:id', authenticateToken, async (req, res) => {
 // Delete budget
 app.delete('/api/budgets/:id', authenticateToken, async (req, res) => {
     try {
-        const [result] = await db.execute(
-            'DELETE FROM budgets WHERE budget_id = ? AND user_id = ?',
+        // Changed: $1, $2 parameters
+        const result = await pool.query(
+            'DELETE FROM budgets WHERE budget_id = $1 AND user_id = $2',
             [req.params.id, req.userId]
         );
 
-        if (result.affectedRows === 0) {
+        // Changed: Use rowCount
+        if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Account not found' });
         }
 
@@ -362,8 +383,9 @@ app.delete('/api/budgets/:id', authenticateToken, async (req, res) => {
 // Get all goals
 app.get('/api/goals', authenticateToken, async (req, res) => {
     try {
-        const [goals] = await db.execute(
-            'SELECT * FROM goals WHERE user_id = ? ORDER BY created_at DESC',
+        // Changed: $1 parameter
+        const { rows: goals } = await pool.query(
+            'SELECT * FROM goals WHERE user_id = $1 ORDER BY created_at DESC',
             [req.userId]
         );
         res.json(goals);
@@ -382,12 +404,13 @@ app.post('/api/goals', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Goal name and target amount are required' });
         }
 
-        const [result] = await db.execute(
-            'INSERT INTO goals (user_id, goal_name, target_amount, current_amount, target_date, status) VALUES (?, ?, ?, ?, ?, ?)',
+        // Changed: $1 - $6 parameters AND RETURNING goal_id
+        const { rows: resultRows } = await pool.query(
+            'INSERT INTO goals (user_id, goal_name, target_amount, current_amount, target_date, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING goal_id',
             [req.userId, goal_name, target_amount, current_amount || 0, target_date || null, status || 'active']
         );
 
-        res.status(201).json({ message: 'Goal created', goalId: result.insertId });
+        res.status(201).json({ message: 'Goal created', goalId: resultRows[0].goal_id });
     } catch (error) {
         console.error('Create goal error:', error);
         res.status(500).json({ error: 'Server error' });
@@ -399,12 +422,14 @@ app.put('/api/goals/:id', authenticateToken, async (req, res) => {
     try {
         const { goal_name, target_amount, current_amount, target_date, status } = req.body;
 
-        const [result] = await db.execute(
-            'UPDATE goals SET goal_name = ?, target_amount = ?, current_amount = ?, target_date = ?, status = ? WHERE goal_id = ? AND user_id = ?',
+        // Changed: $1 - $7 parameters
+        const result = await pool.query(
+            'UPDATE goals SET goal_name = $1, target_amount = $2, current_amount = $3, target_date = $4, status = $5 WHERE goal_id = $6 AND user_id = $7',
             [goal_name, target_amount, current_amount, target_date, status, req.params.id, req.userId]
         );
 
-        if (result.affectedRows === 0) {
+        // Changed: Use rowCount
+        if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Goal not found' });
         }
 
@@ -418,12 +443,14 @@ app.put('/api/goals/:id', authenticateToken, async (req, res) => {
 // Delete goal
 app.delete('/api/goals/:id', authenticateToken, async (req, res) => {
     try {
-        const [result] = await db.execute(
-            'DELETE FROM goals WHERE goal_id = ? AND user_id = ?',
+        // Changed: $1, $2 parameters
+        const result = await pool.query(
+            'DELETE FROM goals WHERE goal_id = $1 AND user_id = $2',
             [req.params.id, req.userId]
         );
 
-        if (result.affectedRows === 0) {
+        // Changed: Use rowCount
+        if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Goal not found' });
         }
 
@@ -439,12 +466,13 @@ app.delete('/api/goals/:id', authenticateToken, async (req, res) => {
 // Get all transactions
 app.get('/api/transactions', authenticateToken, async (req, res) => {
     try {
-        const [transactions] = await db.execute(
+        // Changed: $1 parameter
+        const { rows: transactions } = await pool.query(
             `SELECT t.*, a.account_name, c.category_name 
              FROM transactions t 
              JOIN accounts a ON t.account_id = a.account_id 
              JOIN categories c ON t.category_id = c.category_id 
-             WHERE t.user_id = ? 
+             WHERE t.user_id = $1 
              ORDER BY t.transaction_date DESC, t.created_at DESC`,
             [req.userId]
         );
@@ -457,6 +485,8 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
 
 // Create transaction
 app.post('/api/transactions', authenticateToken, async (req, res) => {
+    const client = await pool.connect(); // Changed: Get client for explicit transaction
+
     try {
         const { account_id, category_id, transaction_type, amount, description, transaction_date } = req.body;
 
@@ -464,28 +494,30 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Required fields are missing' });
         }
 
-        // Start transaction
-        await db.beginTransaction();
+        // Start transaction (Changed: use client)
+        await client.query('BEGIN');
 
         try {
-            // Insert transaction
-            const [result] = await db.execute(
-                'INSERT INTO transactions (user_id, account_id, category_id, transaction_type, amount, description, transaction_date) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            // Insert transaction (Changed: $1 - $7 parameters AND RETURNING transaction_id)
+            const { rows: resultRows } = await client.query(
+                'INSERT INTO transactions (user_id, account_id, category_id, transaction_type, amount, description, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING transaction_id',
                 [req.userId, account_id, category_id, transaction_type, amount, description || null, transaction_date]
             );
 
-            // Update account balance
+            // Update account balance (Changed: $1, $2, $3 parameters)
             const balanceChange = transaction_type === 'income' ? amount : -amount;
-            await db.execute(
-                'UPDATE accounts SET balance = balance + ? WHERE account_id = ? AND user_id = ?',
+            await client.query(
+                'UPDATE accounts SET balance = balance + $1 WHERE account_id = $2 AND user_id = $3',
                 [balanceChange, account_id, req.userId]
             );
 
-            await db.commit();
-            res.status(201).json({ message: 'Transaction created', transactionId: result.insertId });
+            await client.query('COMMIT'); // Changed: use client
+            res.status(201).json({ message: 'Transaction created', transactionId: resultRows[0].transaction_id });
         } catch (error) {
-            await db.rollback();
+            await client.query('ROLLBACK'); // Changed: use client
             throw error;
+        } finally {
+            client.release(); // Must release client
         }
     } catch (error) {
         console.error('Create transaction error:', error);
@@ -495,49 +527,54 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
 
 // Update transaction
 app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
+    const client = await pool.connect(); // Changed: Get client for explicit transaction
+
     try {
         const { account_id, category_id, transaction_type, amount, description, transaction_date } = req.body;
 
-        // Get old transaction
-        const [oldTransactions] = await db.execute(
-            'SELECT * FROM transactions WHERE transaction_id = ? AND user_id = ?',
+        // Get old transaction (Changed: $1, $2 parameters)
+        const { rows: oldTransactions } = await client.query(
+            'SELECT * FROM transactions WHERE transaction_id = $1 AND user_id = $2',
             [req.params.id, req.userId]
         );
 
         if (oldTransactions.length === 0) {
+            client.release();
             return res.status(404).json({ error: 'Transaction not found' });
         }
 
         const oldTransaction = oldTransactions[0];
 
-        await db.beginTransaction();
+        await client.query('BEGIN'); // Changed: use client
 
         try {
-            // Revert old balance change
+            // Revert old balance change (Changed: $1, $2, $3 parameters)
             const oldBalanceChange = oldTransaction.transaction_type === 'income' ? -oldTransaction.amount : oldTransaction.amount;
-            await db.execute(
-                'UPDATE accounts SET balance = balance + ? WHERE account_id = ? AND user_id = ?',
+            await client.query(
+                'UPDATE accounts SET balance = balance + $1 WHERE account_id = $2 AND user_id = $3',
                 [oldBalanceChange, oldTransaction.account_id, req.userId]
             );
 
-            // Update transaction
-            await db.execute(
-                'UPDATE transactions SET account_id = ?, category_id = ?, transaction_type = ?, amount = ?, description = ?, transaction_date = ? WHERE transaction_id = ? AND user_id = ?',
+            // Update transaction (Changed: $1 - $8 parameters)
+            await client.query(
+                'UPDATE transactions SET account_id = $1, category_id = $2, transaction_type = $3, amount = $4, description = $5, transaction_date = $6 WHERE transaction_id = $7 AND user_id = $8',
                 [account_id, category_id, transaction_type, amount, description, transaction_date, req.params.id, req.userId]
             );
 
-            // Apply new balance change
+            // Apply new balance change (Changed: $1, $2, $3 parameters)
             const newBalanceChange = transaction_type === 'income' ? amount : -amount;
-            await db.execute(
-                'UPDATE accounts SET balance = balance + ? WHERE account_id = ? AND user_id = ?',
+            await client.query(
+                'UPDATE accounts SET balance = balance + $1 WHERE account_id = $2 AND user_id = $3',
                 [newBalanceChange, account_id, req.userId]
             );
 
-            await db.commit();
+            await client.query('COMMIT'); // Changed: use client
             res.json({ message: 'Transaction updated' });
         } catch (error) {
-            await db.rollback();
+            await client.query('ROLLBACK'); // Changed: use client
             throw error;
+        } finally {
+            client.release(); // Must release client
         }
     } catch (error) {
         console.error('Update transaction error:', error);
@@ -547,40 +584,44 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
 
 // Delete transaction
 app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
+    const client = await pool.connect(); // Changed: Get client for explicit transaction
     try {
-        // Get transaction
-        const [transactions] = await db.execute(
-            'SELECT * FROM transactions WHERE transaction_id = ? AND user_id = ?',
+        // Get transaction (Changed: $1, $2 parameters)
+        const { rows: transactions } = await client.query(
+            'SELECT * FROM transactions WHERE transaction_id = $1 AND user_id = $2',
             [req.params.id, req.userId]
         );
 
         if (transactions.length === 0) {
+            client.release();
             return res.status(404).json({ error: 'Transaction not found' });
         }
 
         const transaction = transactions[0];
 
-        await db.beginTransaction();
+        await client.query('BEGIN'); // Changed: use client
 
         try {
-            // Revert balance change
+            // Revert balance change (Changed: $1, $2, $3 parameters)
             const balanceChange = transaction.transaction_type === 'income' ? -transaction.amount : transaction.amount;
-            await db.execute(
-                'UPDATE accounts SET balance = balance + ? WHERE account_id = ? AND user_id = ?',
+            await client.query(
+                'UPDATE accounts SET balance = balance + $1 WHERE account_id = $2 AND user_id = $3',
                 [balanceChange, transaction.account_id, req.userId]
             );
 
-            // Delete transaction
-            await db.execute(
-                'DELETE FROM transactions WHERE transaction_id = ? AND user_id = ?',
+            // Delete transaction (Changed: $1, $2 parameters)
+            await client.query(
+                'DELETE FROM transactions WHERE transaction_id = $1 AND user_id = $2',
                 [req.params.id, req.userId]
             );
 
-            await db.commit();
+            await client.query('COMMIT'); // Changed: use client
             res.json({ message: 'Transaction deleted' });
         } catch (error) {
-            await db.rollback();
+            await client.query('ROLLBACK'); // Changed: use client
             throw error;
+        } finally {
+            client.release(); // Must release client
         }
     } catch (error) {
         console.error('Delete transaction error:', error);
@@ -594,27 +635,27 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     try {
         const userId = req.userId;
 
-        // Get total balance
-        const [balanceResult] = await db.execute(
-            'SELECT SUM(balance) as total_balance FROM accounts WHERE user_id = ?',
+        // Get total balance (Changed: $1 parameter)
+        const { rows: balanceResult } = await pool.query(
+            'SELECT SUM(balance) as total_balance FROM accounts WHERE user_id = $1',
             [userId]
         );
 
-        // Get monthly income
-        const [incomeResult] = await db.execute(
-            'SELECT SUM(amount) as total_income FROM transactions WHERE user_id = ? AND transaction_type = "income" AND MONTH(transaction_date) = MONTH(CURRENT_DATE()) AND YEAR(transaction_date) = YEAR(CURRENT_DATE())',
+        // Get monthly income (Changed: Date functions to PostgreSQL EXTRACT, $1 parameter)
+        const { rows: incomeResult } = await pool.query(
+            'SELECT SUM(amount) as total_income FROM transactions WHERE user_id = $1 AND transaction_type = \'income\' AND EXTRACT(MONTH FROM transaction_date) = EXTRACT(MONTH FROM CURRENT_DATE) AND EXTRACT(YEAR FROM transaction_date) = EXTRACT(YEAR FROM CURRENT_DATE)',
             [userId]
         );
 
-        // Get monthly expenses
-        const [expenseResult] = await db.execute(
-            'SELECT SUM(amount) as total_expense FROM transactions WHERE user_id = ? AND transaction_type = "expense" AND MONTH(transaction_date) = MONTH(CURRENT_DATE()) AND YEAR(transaction_date) = YEAR(CURRENT_DATE())',
+        // Get monthly expenses (Changed: Date functions to PostgreSQL EXTRACT, $1 parameter)
+        const { rows: expenseResult } = await pool.query(
+            'SELECT SUM(amount) as total_expense FROM transactions WHERE user_id = $1 AND transaction_type = \'expense\' AND EXTRACT(MONTH FROM transaction_date) = EXTRACT(MONTH FROM CURRENT_DATE) AND EXTRACT(YEAR FROM transaction_date) = EXTRACT(YEAR FROM CURRENT_DATE)',
             [userId]
         );
 
-        // Get active goals
-        const [goalsResult] = await db.execute(
-            'SELECT COUNT(*) as active_goals FROM goals WHERE user_id = ? AND status = "active"',
+        // Get active goals (Changed: $1 parameter)
+        const { rows: goalsResult } = await pool.query(
+            'SELECT COUNT(*) as active_goals FROM goals WHERE user_id = $1 AND status = \'active\'',
             [userId]
         );
 
@@ -636,4 +677,3 @@ initDB().then(() => {
         console.log(`Server running on http://localhost:${PORT}`);
     });
 });
-
